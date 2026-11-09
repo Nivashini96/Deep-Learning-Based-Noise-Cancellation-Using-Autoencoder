@@ -1,0 +1,1008 @@
+Audio signals are often affected by background noise such as traffic, crowd, and environmental disturbances, which degrade speech quality. This project proposes a deep learning-based noise cancellation system using an Autoencoder. The model is trained on clean and noisy speech data to learn meaningful representations of speech signals. Audio signals are converted into spectrograms, and the autoencoder reconstructs clean speech from noisy input. The proposed system improves Signal-to-Noise Ratio (SNR) and enhances speech clarity, making it suitable for real-world communication and speech processing applications.
+# ── CELL 1: Install Dependencies ─────────────────────────────────────────────
+# @title Cell 1 — Install Dependencies (run first, restart runtime if prompted)
+
+# Install packages one-by-one to avoid version conflicts.
+# scikit-image, tensorflow, sklearn, matplotlib are pre-installed in Colab.
+import subprocess, sys, importlib
+
+def pip_install(pkg):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=True)
+
+pip_install("librosa>=0.10.0")   # audio feature extraction
+pip_install("soundfile")          # WAV read/write
+pip_install("noisereduce")        # statistical noise reduction (latest stable)
+pip_install("audioread")          # librosa MP3 backend
+
+# Verify all imports work
+print("\n--- Verification ---")
+for pkg, import_name in [
+    ("librosa",     "librosa"),
+    ("soundfile",   "soundfile"),
+    ("noisereduce", "noisereduce"),
+    ("scikit-image","skimage"),
+]:
+    try:
+        mod = importlib.import_module(import_name)
+        ver = getattr(mod, "__version__", "n/a")
+        print(f"  ✅  {pkg:<14} version: {ver}")
+    except ImportError as e:
+        print(f"  ❌  {pkg:<14} FAILED → {e}")
+
+print("\n✅ Cell 1 complete.")
+print("   If Colab shows a 'Restart session' button → click it, then re-run from Cell 2.")
+
+# ── CELL 2: Imports & Global Config ──────────────────────────────────────────
+# @title Cell 2 — Imports & Global Configuration
+
+import os
+import glob           # ← moved here so every later cell can use it
+import random
+import warnings
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import seaborn as sns
+
+import librosa
+import librosa.display
+import soundfile as sf
+import noisereduce as nr
+from skimage.metrics import structural_similarity as ssim
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, callbacks
+from sklearn.model_selection import train_test_split
+from IPython.display import Audio, display
+
+warnings.filterwarnings('ignore')
+
+# ── Global hyper-parameters ────────────────────────────────────────────────────
+SEED        = 42
+SR          = 16000     # Sample rate (Hz)
+N_FFT       = 1024      # FFT window
+HOP_LENGTH  = 256       # Hop between frames
+N_MELS      = 128       # Mel filter banks
+PATCH_SIZE  = 128       # H×W of each spectrogram patch fed to U-Net
+PATCH_STEP  = 64        # Stride between patches (50% overlap)
+BATCH_SIZE  = 16
+EPOCHS      = 60
+LR          = 1e-3
+NOISE_TYPES = ['white', 'pink', 'brown', 'babble']
+SNR_RANGE   = (0, 15)   # dB range of synthetic noise added to clean speech
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# ── Plot theme ─────────────────────────────────────────────────────────────────
+plt.rcParams.update({
+    'figure.facecolor': '#0d0f1e',
+    'axes.facecolor':   '#111328',
+    'axes.edgecolor':   '#2a2d4a',
+    'axes.labelcolor':  '#c0c0e0',
+    'xtick.color':      '#8b8db8',
+    'ytick.color':      '#8b8db8',
+    'text.color':       '#f0f0ff',
+    'grid.color':       '#1e2040',
+    'grid.linestyle':   '--',
+    'grid.alpha':       0.5,
+    'font.family':      'DejaVu Sans',
+    'figure.dpi':       120,
+})
+
+ACCENT = '#6c63ff'
+CYAN   = '#22d3ee'
+GREEN  = '#34d399'
+ROSE   = '#f87171'
+AMBER  = '#fbbf24'
+
+print("✅ Config ready.")
+print(f"   TensorFlow  : {tf.__version__}")
+print(f"   Librosa     : {librosa.__version__}")
+print(f"   GPU devices : {tf.config.list_physical_devices('GPU')}")
+
+# ── CELL 3: Download Dataset ──────────────────────────────────────────────────
+# @title Cell 3 — Download LibriSpeech dev-clean (~344 MB)
+
+import subprocess
+
+CLEAN_DIR = '/content/clean_speech'
+NOISY_DIR = '/content/noisy_speech'
+os.makedirs(CLEAN_DIR, exist_ok=True)
+os.makedirs(NOISY_DIR, exist_ok=True)
+
+LIBRI_URL  = "https://www.openslr.org/resources/12/dev-clean.tar.gz"
+LIBRI_PATH = "/content/dev-clean.tar.gz"
+
+if not os.path.exists('/content/LibriSpeech/dev-clean'):
+    print("⬇️  Downloading LibriSpeech dev-clean (~344 MB) — takes ~2-3 min…")
+    subprocess.run(['wget', '-q', '--show-progress', '-O', LIBRI_PATH, LIBRI_URL], check=True)
+    subprocess.run(['tar', '-xzf', LIBRI_PATH, '-C', '/content/'], check=True)
+    print("✅ Dataset extracted to /content/LibriSpeech/dev-clean/")
+else:
+    print("✅ Dataset already downloaded.")
+
+# Collect FLAC files and convert a subset to 16-kHz WAV
+all_flacs = glob.glob('/content/LibriSpeech/dev-clean/**/*.flac', recursive=True)
+random.shuffle(all_flacs)
+SUBSET = all_flacs[:300]   # 300 utterances ≈ 10 min of clean speech
+
+print(f"📂 Using {len(SUBSET)} utterances.")
+print("🔄 Converting to 16 kHz mono WAV…")
+
+for i, fp in enumerate(SUBSET):
+    audio, _ = librosa.load(fp, sr=SR, mono=True)
+    sf.write(os.path.join(CLEAN_DIR, f'clean_{i:04d}.wav'), audio, SR)
+
+clean_files = sorted(glob.glob(os.path.join(CLEAN_DIR, '*.wav')))
+print(f"✅ {len(clean_files)} clean WAV files ready.")
+
+# ── CELL 4: Noise Generators + Create Noisy Dataset ──────────────────────────
+# @title Cell 4 — Synthetic Noise Generators & Noisy-Clean Pair Creation
+
+def generate_white_noise(length, amplitude=1.0):
+    return np.random.normal(0, amplitude, length).astype(np.float32)
+
+def generate_pink_noise(length, amplitude=1.0):
+    """1/f (pink) noise — IFFT method."""
+    f = np.fft.rfftfreq(length)
+    f[0] = 1e-10          # avoid divide-by-zero at DC
+    power   = 1.0 / np.sqrt(f)
+    phase   = np.random.uniform(0, 2 * np.pi, len(f))
+    noise   = np.fft.irfft(power * np.exp(1j * phase), n=length).astype(np.float32)
+    return noise / (np.max(np.abs(noise)) + 1e-8) * amplitude
+
+def generate_brown_noise(length, amplitude=1.0):
+    """Brownian (1/f²) noise — cumulative-sum method."""
+    brown = np.cumsum(np.random.normal(0, 1, length)).astype(np.float32)
+    brown -= brown.mean()
+    return brown / (np.max(np.abs(brown)) + 1e-8) * amplitude
+
+def generate_babble_noise(length, file_list, amplitude=1.0):
+    """Babble: overlay of 3-6 random speech clips."""
+    noise = np.zeros(length, dtype=np.float32)
+    for _ in range(random.randint(3, 6)):
+        seg, _ = librosa.load(random.choice(file_list), sr=SR, mono=True)
+        if len(seg) < length:
+            seg = np.tile(seg, (length // len(seg)) + 1)
+        start = random.randint(0, max(len(seg) - length, 0))
+        noise += seg[start : start + length]
+    return noise / (np.max(np.abs(noise)) + 1e-8) * amplitude
+
+def add_noise_at_snr(clean, noise, target_snr_db):
+    """Scale noise to achieve a target SNR and mix with clean signal."""
+    clean_rms          = np.sqrt(np.mean(clean ** 2)) + 1e-10
+    noise_rms          = np.sqrt(np.mean(noise ** 2)) + 1e-10
+    desired_noise_rms  = clean_rms / (10 ** (target_snr_db / 20.0))
+    scaled_noise       = noise * (desired_noise_rms / noise_rms)
+    return np.clip(clean + scaled_noise, -1.0, 1.0).astype(np.float32)
+
+NOISE_FN_MAP = {
+    'white': generate_white_noise,
+    'pink':  generate_pink_noise,
+    'brown': generate_brown_noise,
+}
+
+print("🔊 Generating noisy versions of all clean files…")
+noisy_files = []
+
+for i, fp in enumerate(clean_files):
+    audio, _ = librosa.load(fp, sr=SR, mono=True)
+    ntype     = random.choice(NOISE_TYPES)
+    snr_db    = random.uniform(*SNR_RANGE)
+
+    if ntype == 'babble':
+        noise = generate_babble_noise(len(audio), clean_files)
+    else:
+        noise = NOISE_FN_MAP[ntype](len(audio))
+
+    noisy   = add_noise_at_snr(audio, noise, snr_db)
+    out_fp  = os.path.join(NOISY_DIR, f'noisy_{i:04d}.wav')
+    sf.write(out_fp, noisy, SR)
+    noisy_files.append(out_fp)
+
+    if (i + 1) % 50 == 0:
+        print(f"  {i+1}/{len(clean_files)} completed…")
+
+print(f"✅ {len(noisy_files)} noisy files created.")
+
+# ── CELL 5: Spectrogram Utilities ─────────────────────────────────────────────
+# @title Cell 5 — Spectrogram Helper Functions
+
+def wav_to_mel(audio, sr=SR):
+    """Waveform → mel-spectrogram (dB scale, float32)."""
+    mel    = librosa.feature.melspectrogram(
+                 y=audio, sr=sr, n_fft=N_FFT,
+                 hop_length=HOP_LENGTH, n_mels=N_MELS)
+    return librosa.power_to_db(mel, ref=np.max).astype(np.float32)
+
+def normalize_spec(spec):
+    """Shift & scale mel-spec to [0, 1]. Returns (normed, min, max)."""
+    mn, mx = spec.min(), spec.max()
+    return (spec - mn) / (mx - mn + 1e-8), mn, mx
+
+def denormalize_spec(spec_n, mn, mx):
+    """Reverse the normalization."""
+    return spec_n * (mx - mn) + mn
+
+def mel_to_wav(mel_db, sr=SR, orig_len=None):
+    """
+    Mel-spectrogram (dB) → waveform.
+    Uses librosa.feature.inverse.mel_to_audio which handles
+    inverse-mel filtering + Griffin-Lim phase estimation internally.
+    FIX: replaces the old mel_to_stft + griffinlim two-step call
+         which could produce negative values causing nan/errors.
+    """
+    mel_power = librosa.db_to_power(mel_db)
+    # Ensure no negative values (can appear after autoencoder denorm)
+    mel_power = np.maximum(mel_power, 0.0)
+    audio = librosa.feature.inverse.mel_to_audio(
+                mel_power, sr=sr,
+                n_fft=N_FFT, hop_length=HOP_LENGTH,
+                n_iter=64, window='hann')
+    if orig_len:
+        audio = librosa.util.fix_length(audio, size=orig_len)
+    return audio.astype(np.float32)
+
+def extract_patches(spec_norm, size=PATCH_SIZE, step=PATCH_STEP):
+    """Extract overlapping square patches; pad spec if needed."""
+    H, W = spec_norm.shape
+    # Pad so the spec is at least 'size' in each dimension
+    padH = max(size, H + (size - H % size) % size)
+    padW = max(size, W + (size - W % size) % size)
+    padded = np.pad(spec_norm, ((0, padH - H), (0, padW - W)), mode='reflect')
+
+    patches, coords = [], []
+    for r in range(0, padH - size + 1, step):
+        for c in range(0, padW - size + 1, step):
+            patches.append(padded[r:r+size, c:c+size])
+            coords.append((r, c, padH, padW))
+    return np.array(patches, dtype=np.float32), coords, (H, W)
+
+def reconstruct_from_patches(patches, coords, orig_shape, size=PATCH_SIZE):
+    """Overlap-add reconstruction with a Hann window to smooth seams."""
+    H, W           = orig_shape
+    padH, padW     = coords[0][2], coords[0][3]
+    recon          = np.zeros((padH, padW), np.float32)
+    weight         = np.zeros((padH, padW), np.float32)
+    win            = np.outer(np.hanning(size), np.hanning(size)).astype(np.float32)
+
+    for patch, (r, c, _, _) in zip(patches, coords):
+        recon [r:r+size, c:c+size] += patch * win
+        weight[r:r+size, c:c+size] += win
+
+    return (recon / np.maximum(weight, 1e-8))[:H, :W]
+
+print("✅ Spectrogram utilities ready.")
+
+# ── CELL 6: Build Patch Dataset ───────────────────────────────────────────────
+# @title Cell 6 — Build Patch Dataset for Training
+
+noisy_files_sorted = sorted(glob.glob(os.path.join(NOISY_DIR, '*.wav')))
+clean_files_sorted = sorted(glob.glob(os.path.join(CLEAN_DIR, '*.wav')))
+
+print(f"🔧 Extracting spectrogram patches from {len(noisy_files_sorted)} pairs…")
+
+noisy_patches_all = []
+clean_patches_all = []
+
+for i, (nf, cf) in enumerate(zip(noisy_files_sorted, clean_files_sorted)):
+    noisy_audio, _ = librosa.load(nf, sr=SR, mono=True)
+    clean_audio, _ = librosa.load(cf, sr=SR, mono=True)
+
+    mel_noisy = wav_to_mel(noisy_audio)
+    mel_clean = wav_to_mel(clean_audio)
+
+    # Normalize using the noisy spectrogram's statistics (consistent reference)
+    n_norm, mn, mx = normalize_spec(mel_noisy)
+    c_norm = np.clip((mel_clean - mn) / (mx - mn + 1e-8), 0.0, 1.0)
+
+    p_noisy, _, _ = extract_patches(n_norm)
+    p_clean, _, _ = extract_patches(c_norm)
+
+    noisy_patches_all.append(p_noisy)
+    clean_patches_all.append(p_clean)
+
+    if (i + 1) % 50 == 0:
+        print(f"  {i+1}/{len(noisy_files_sorted)} processed…")
+
+# Stack into arrays and add channel dim
+X = np.concatenate(noisy_patches_all, axis=0)[..., np.newaxis]
+Y = np.concatenate(clean_patches_all, axis=0)[..., np.newaxis]
+
+print(f"\n✅ Dataset ready:")
+print(f"   X (noisy patches) : {X.shape}  dtype={X.dtype}")
+print(f"   Y (clean patches) : {Y.shape}  dtype={Y.dtype}")
+
+X_train, X_val, Y_train, Y_val = train_test_split(
+    X, Y, test_size=0.15, random_state=SEED, shuffle=True)
+print(f"   Train={len(X_train)}   Val={len(X_val)}")
+
+# ── CELL 7: Build U-Net Autoencoder Model ────────────────────────────────────
+# @title Cell 7 — U-Net Convolutional Autoencoder Architecture
+
+def build_unet(input_shape=(PATCH_SIZE, PATCH_SIZE, 1)):
+    """
+    U-Net Convolutional Autoencoder for spectrogram denoising.
+    Skip connections let the decoder recover fine spectral detail
+    that the bottleneck would otherwise discard.
+
+    Input  → noisy mel-patch  [0, 1]
+    Output → clean mel-patch  [0, 1]
+    """
+    inp = keras.Input(shape=input_shape, name='noisy_patch')
+
+    def conv_block(x, filters, dropout=0.0):
+        x = layers.Conv2D(filters, 3, padding='same')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Activation('relu')(x)
+        x = layers.Conv2D(filters, 3, padding='same')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Activation('relu')(x)
+        if dropout > 0:
+            x = layers.Dropout(dropout)(x)
+        return x
+
+    # ── Encoder ───────────────────────────────────────────────────────────────
+    e1 = conv_block(inp, 32);           p1 = layers.MaxPooling2D(2)(e1)   # 64×64
+    e2 = conv_block(p1,  64);           p2 = layers.MaxPooling2D(2)(e2)   # 32×32
+    e3 = conv_block(p2,  128, 0.1);     p3 = layers.MaxPooling2D(2)(e3)   # 16×16
+    e4 = conv_block(p3,  256, 0.1);     p4 = layers.MaxPooling2D(2)(e4)   # 8×8
+
+    # ── Bottleneck ────────────────────────────────────────────────────────────
+    bn = conv_block(p4, 512, 0.2)                                          # 8×8
+
+    # ── Decoder (transpose-conv + skip concatenation) ─────────────────────────
+    d4 = layers.Conv2DTranspose(256, 2, strides=2, padding='same')(bn)
+    d4 = layers.Concatenate()([d4, e4]); d4 = conv_block(d4, 256, 0.1)
+
+    d3 = layers.Conv2DTranspose(128, 2, strides=2, padding='same')(d4)
+    d3 = layers.Concatenate()([d3, e3]); d3 = conv_block(d3, 128, 0.1)
+
+    d2 = layers.Conv2DTranspose(64,  2, strides=2, padding='same')(d3)
+    d2 = layers.Concatenate()([d2, e2]); d2 = conv_block(d2, 64)
+
+    d1 = layers.Conv2DTranspose(32,  2, strides=2, padding='same')(d2)
+    d1 = layers.Concatenate()([d1, e1]); d1 = conv_block(d1, 32)
+
+    # ── Output: sigmoid → [0, 1] ──────────────────────────────────────────────
+    out = layers.Conv2D(1, 1, activation='sigmoid', name='clean_patch')(d1)
+
+    return keras.Model(inp, out, name='UNet_Denoiser')
+
+model = build_unet()
+model.summary(line_length=90)
+
+# ── Combined loss: 70% MSE + 30% SSIM loss ────────────────────────────────────
+def ssim_loss(y_true, y_pred):
+    return 1.0 - tf.reduce_mean(tf.image.ssim(y_true, y_pred, max_val=1.0))
+
+def combined_loss(y_true, y_pred):
+    return 0.7 * tf.reduce_mean(tf.square(y_true - y_pred)) + 0.3 * ssim_loss(y_true, y_pred)
+
+model.compile(
+    optimizer=keras.optimizers.Adam(LR),
+    loss=combined_loss,
+    metrics=['mae', tf.keras.metrics.MeanSquaredError(name='mse')]
+)
+print(f"\n✅ Model compiled  ·  Parameters: {model.count_params():,}")
+
+
+# ── CELL 8: Train the Autoencoder ─────────────────────────────────────────────
+# @title Cell 8 — Train the Autoencoder
+
+CKPT_PATH = '/content/best_unet_denoiser.keras'
+
+cb_list = [
+    callbacks.ModelCheckpoint(CKPT_PATH, monitor='val_loss',
+                               save_best_only=True, verbose=1),
+    callbacks.EarlyStopping(monitor='val_loss', patience=10,
+                             restore_best_weights=True, verbose=1),
+    callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5,
+                                 patience=5, min_lr=1e-6, verbose=1),
+    callbacks.TerminateOnNaN(),
+]
+
+print(f"🚀 Training for up to {EPOCHS} epochs  |  batch={BATCH_SIZE}")
+print(f"   Train: {len(X_train)}  |  Val: {len(X_val)}")
+print("─" * 60)
+
+t0 = time.time()
+history = model.fit(
+    X_train, Y_train,
+    validation_data=(X_val, Y_val),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    callbacks=cb_list,
+    shuffle=True,
+    verbose=1,
+)
+print(f"\n✅ Training done in {(time.time()-t0)/60:.1f} min")
+print(f"   Best val_loss : {min(history.history['val_loss']):.6f}")
+
+# ── CELL 9: Training Curves Plot ──────────────────────────────────────────────
+# @title Cell 9 — Plot Training & Validation Curves
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig.patch.set_facecolor('#07080f')
+fig.suptitle('Training History — U-Net Autoencoder Denoiser',
+             fontsize=15, fontweight='bold', color='white', y=1.02)
+
+metric_pairs = [
+    ('loss', 'val_loss', 'Combined Loss  (0.7·MSE + 0.3·SSIM)', ACCENT, CYAN),
+    ('mae',  'val_mae',  'Mean Absolute Error (MAE)',             GREEN,  AMBER),
+    ('mse',  'val_mse',  'Mean Squared Error  (MSE)',             ROSE,   '#a78bfa'),
+]
+
+for ax, (trn_k, val_k, title, tc, vc) in zip(axes, metric_pairs):
+    ep       = range(1, len(history.history[trn_k]) + 1)
+    best_ep  = int(np.argmin(history.history[val_k])) + 1
+    best_val = min(history.history[val_k])
+
+    ax.plot(ep, history.history[trn_k], color=tc, lw=2.2, label='Train')
+    ax.plot(ep, history.history[val_k], color=vc, lw=2.2, ls='--', label='Validation')
+    ax.axvline(best_ep, color='white', lw=1, ls=':', alpha=0.5)
+    ax.scatter([best_ep], [best_val], color='white', s=80, zorder=5,
+               label=f'Best epoch {best_ep}')
+    ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Value')
+    ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('/content/training_curves.png', bbox_inches='tight', dpi=150, facecolor='#07080f')
+plt.show()
+print("✅ Saved: /content/training_curves.png")
+
+# ── CELL 10: Define Metrics & Inference ───────────────────────────────────────
+# @title Cell 10 — Metric Functions & Full Inference Pipeline
+
+def compute_snr(clean, estimated):
+    """Signal-to-Noise Ratio (dB). Higher = better."""
+    n = min(len(clean), len(estimated))
+    c, e = clean[:n], estimated[:n]
+    noise_power  = np.mean((c - e) ** 2) + 1e-10
+    signal_power = np.mean(c ** 2)
+    return 10 * np.log10(signal_power / noise_power)
+
+def compute_psnr(clean, estimated):
+    """Peak SNR (dB). Higher = better."""
+    n = min(len(clean), len(estimated))
+    c, e = clean[:n], estimated[:n]
+    mse = np.mean((c - e) ** 2)
+    if mse < 1e-12:
+        return float('inf')
+    return 20 * np.log10(np.max(np.abs(c)) / (np.sqrt(mse) + 1e-10))
+
+def compute_spec_ssim(mel_a, mel_b):
+    """SSIM between two mel-spectrograms (range-normalised). Closer to 1 = better."""
+    def _norm(s): return (s - s.min()) / (s.max() - s.min() + 1e-8)
+    a, b = _norm(mel_a), _norm(mel_b)
+    h, w = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1])
+    return float(ssim(a[:h, :w], b[:h, :w], data_range=1.0))
+
+def denoise_audio(noisy_audio):
+    """
+    Full inference pipeline:
+      noisy waveform → mel-spec → normalise → patch → U-Net → reconstruct → waveform
+    Returns: (denoised_wav, mel_noisy, mel_denoised)
+    """
+    mel_noisy              = wav_to_mel(noisy_audio)
+    n_norm, mn, mx        = normalize_spec(mel_noisy)
+    patches, coords, shape = extract_patches(n_norm)
+
+    patches_out = model.predict(patches[..., np.newaxis], verbose=0)[..., 0]
+
+    spec_denoised  = reconstruct_from_patches(patches_out, coords, shape)
+    mel_denoised   = denormalize_spec(spec_denoised, mn, mx)
+    audio_denoised = mel_to_wav(mel_denoised, SR, orig_len=len(noisy_audio))
+    return audio_denoised, mel_noisy, mel_denoised
+
+def apply_stat_nr(audio):
+    """
+    Statistical noise reduction via noisereduce.
+    FIX: removed the invalid 'verbose' parameter that caused TypeError.
+    """
+    noise_clip = audio[:max(int(0.5 * SR), 1)]
+    return nr.reduce_noise(
+        y=audio,
+        sr=SR,
+        y_noise=noise_clip,
+        prop_decrease=0.80,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+    )
+
+print("✅ Metric functions & inference pipeline defined.")
+
+# ── CELL 11: Evaluate on Test Set ─────────────────────────────────────────────
+# @title Cell 11 — Evaluate on 20 Held-Out Test Files
+
+# Use last 20 files (never seen during training)
+test_noisy = noisy_files_sorted[-20:]
+test_clean = clean_files_sorted[-20:]
+
+print(f"📊 Evaluating on {len(test_noisy)} test files…")
+results = []
+
+for nf, cf in zip(test_noisy, test_clean):
+    noisy_wav, _ = librosa.load(nf, sr=SR, mono=True)
+    clean_wav, _ = librosa.load(cf, sr=SR, mono=True)
+
+    nr_wav        = apply_stat_nr(noisy_wav)
+    ae_wav, mel_n, mel_ae = denoise_audio(noisy_wav)
+    mel_clean_ref = wav_to_mel(clean_wav)
+
+    results.append({
+        'snr_noisy' : compute_snr (clean_wav, noisy_wav),
+        'snr_nr'    : compute_snr (clean_wav, nr_wav),
+        'snr_ae'    : compute_snr (clean_wav, ae_wav),
+        'psnr_noisy': compute_psnr(clean_wav, noisy_wav),
+        'psnr_nr'   : compute_psnr(clean_wav, nr_wav),
+        'psnr_ae'   : compute_psnr(clean_wav, ae_wav),
+        'ssim_noisy': compute_spec_ssim(mel_clean_ref, mel_n),
+        'ssim_nr'   : compute_spec_ssim(mel_clean_ref, wav_to_mel(nr_wav)),
+        'ssim_ae'   : compute_spec_ssim(mel_clean_ref, mel_ae),
+    })
+
+# Aggregate means & std
+metric_keys = ['snr', 'psnr', 'ssim']
+methods     = ['noisy', 'nr', 'ae']
+summary     = {}
+for k in metric_keys:
+    for m in methods:
+        vals = [r[f'{k}_{m}'] for r in results]
+        summary[f'{k}_{m}'] = (float(np.mean(vals)), float(np.std(vals)))
+
+# Pretty-print table
+print("\n┌──────────────────────────────────────────────────────────────────┐")
+print("│                   AUDIO QUALITY METRICS SUMMARY                 │")
+print("├──────────────────┬─────────────────┬──────────────┬─────────────┤")
+print("│   Metric         │   Noisy Input   │  StatNR Only │  U-Net AE   │")
+print("├──────────────────┼─────────────────┼──────────────┼─────────────┤")
+for k, unit in [('snr', 'dB'), ('psnr', 'dB'), ('ssim', '')]:
+    row = f"│ {k.upper():<8} {unit:<4}    "
+    for m in methods:
+        mn, sd = summary[f'{k}_{m}']
+        row += f"│  {mn:+7.2f}±{sd:5.2f}  "
+    print(row + "│")
+print("└──────────────────┴─────────────────┴──────────────┴─────────────┘")
+
+for k, label in [('snr','SNR'), ('psnr','PSNR'), ('ssim','SSIM')]:
+    gain = summary[f'{k}_ae'][0] - summary[f'{k}_noisy'][0]
+    print(f"🎯 {label} improvement (U-Net vs Noisy): {gain:+.4f}")
+
+# ── CELL 12: Metrics Bar Chart ────────────────────────────────────────────────
+# @title Cell 12 — Metrics Comparison Bar Chart
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 6))
+fig.patch.set_facecolor('#07080f')
+fig.suptitle('Audio Quality Metrics: Noisy vs Statistical NR vs U-Net Autoencoder',
+             fontsize=14, fontweight='bold', color='white', y=1.02)
+
+bar_configs = [
+    ('SNR (dB)',  'snr',  'Higher = Better ↑'),
+    ('PSNR (dB)', 'psnr', 'Higher = Better ↑'),
+    ('Spec SSIM', 'ssim', 'Higher = Better ↑  (0 → 1)'),
+]
+bar_labels = ['Noisy Input', 'StatNR Only', 'U-Net AE']
+bar_colors = [ROSE, AMBER, GREEN]
+
+for ax, (ylabel, key, note) in zip(axes, bar_configs):
+    means = [summary[f'{key}_{m}'][0] for m in methods]
+    stds  = [summary[f'{key}_{m}'][1] for m in methods]
+    bars  = ax.bar(bar_labels, means, color=bar_colors, width=0.55,
+                   yerr=stds, capsize=5, error_kw={'color': 'white', 'lw': 1.5},
+                   zorder=3, edgecolor='#1e2040', linewidth=0.8)
+    for bar, val in zip(bars, means):
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + (max(stds) * 0.05 if max(stds) > 0 else 0.01),
+                f'{val:.2f}', ha='center', va='bottom',
+                fontsize=10, fontweight='bold', color='white')
+    ax.set_title(f'{ylabel}\n{note}', fontsize=11, fontweight='bold', pad=8)
+    ax.set_ylabel(ylabel, fontsize=10)
+    ax.tick_params(axis='x', labelsize=9, rotation=10)
+    ax.grid(True, axis='y', alpha=0.3); ax.set_axisbelow(True)
+
+plt.tight_layout()
+plt.savefig('/content/metrics_comparison.png', bbox_inches='tight', dpi=150, facecolor='#07080f')
+plt.show()
+print("✅ Saved: /content/metrics_comparison.png")
+
+# ── CELL 13: SNR Distribution Box Plot ───────────────────────────────────────
+# @title Cell 13 — SNR Distribution (Box Plot + Per-Sample Scatter)
+
+snr_noisy_vals = [r['snr_noisy'] for r in results]
+snr_nr_vals    = [r['snr_nr']    for r in results]
+snr_ae_vals    = [r['snr_ae']    for r in results]
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.patch.set_facecolor('#07080f')
+fig.suptitle('SNR Distribution Across Test Set', fontsize=14, fontweight='bold', color='white')
+
+# Box plot
+bp = axes[0].boxplot(
+    [snr_noisy_vals, snr_nr_vals, snr_ae_vals],
+    labels=['Noisy', 'StatNR', 'U-Net AE'],
+    patch_artist=True, notch=True,
+    medianprops={'color': 'white', 'lw': 2},
+    whiskerprops={'color': '#8b8db8'},
+    capprops={'color': '#8b8db8'},
+    flierprops={'marker': 'o', 'markerfacecolor': ROSE, 'ms': 5}
+)
+for patch, col in zip(bp['boxes'], [ROSE, AMBER, GREEN]):
+    patch.set_facecolor(col); patch.set_alpha(0.7)
+axes[0].set_title('Box Plot — SNR (dB)', fontsize=12, fontweight='bold')
+axes[0].set_ylabel('SNR (dB)'); axes[0].grid(True, axis='y', alpha=0.3)
+axes[0].axhline(0, color='white', ls=':', alpha=0.4)
+
+# Per-sample scatter
+ids = range(len(results))
+axes[1].scatter(ids, snr_noisy_vals, c=ROSE,  s=60, alpha=0.8, label='Noisy', zorder=3)
+axes[1].scatter(ids, snr_nr_vals,    c=AMBER, s=60, alpha=0.8, label='StatNR', zorder=3)
+axes[1].scatter(ids, snr_ae_vals,    c=GREEN, s=80, alpha=0.9, label='U-Net AE', zorder=4, marker='*')
+for i, (n, a) in enumerate(zip(snr_noisy_vals, snr_ae_vals)):
+    axes[1].plot([i, i], [n, a], color='gray', lw=0.6, alpha=0.4)
+axes[1].set_title('Per-Sample SNR: Before vs After', fontsize=12, fontweight='bold')
+axes[1].set_xlabel('Test Sample'); axes[1].set_ylabel('SNR (dB)')
+axes[1].legend(fontsize=9); axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('/content/snr_distribution.png', bbox_inches='tight', dpi=150, facecolor='#07080f')
+plt.show()
+print("✅ Saved: /content/snr_distribution.png")
+
+# ── CELL 14: Spectrogram Comparison ───────────────────────────────────────────
+# @title Cell 14 — Spectrogram Comparison (3 Test Samples)
+import os
+import glob
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+import librosa
+import librosa.display
+
+
+chosen = random.sample(list(zip(test_noisy, test_clean)), 3)
+
+fig = plt.figure(figsize=(18, 12))
+fig.patch.set_facecolor('#07080f')
+fig.suptitle('Spectrogram Comparison: Noisy → U-Net Denoised → Clean Reference',
+             fontsize=14, fontweight='bold', color='white', y=1.01)
+
+for row, (nf, cf) in enumerate(chosen):
+    noisy_wav, _ = librosa.load(nf, sr=SR, mono=True)
+    clean_wav, _ = librosa.load(cf, sr=SR, mono=True)
+    ae_wav, mel_n, mel_ae = denoise_audio(noisy_wav)
+    mel_clean = wav_to_mel(clean_wav)
+
+    for col, (spec, title, cmap) in enumerate(zip(
+        [mel_n, mel_ae, mel_clean],
+        ['Noisy Input', 'U-Net Denoised', 'Clean Reference'],
+        ['magma', 'viridis', 'plasma']
+    )):
+        ax  = fig.add_subplot(3, 3, row * 3 + col + 1)
+        img = librosa.display.specshow(spec, sr=SR, hop_length=HOP_LENGTH,
+                                        x_axis='time', y_axis='mel',
+                                        fmax=SR // 2, ax=ax, cmap=cmap)
+        ax.set_title(f'Sample {row+1} — {title}', fontsize=10, fontweight='bold',
+                     color='white', pad=4)
+        ax.set_xlabel('Time (s)' if row == 2 else '')
+        ax.set_ylabel('Hz' if col == 0 else '')
+        plt.colorbar(img, ax=ax, format='%+2.0f dB', pad=0.01)
+
+plt.tight_layout()
+plt.savefig('/content/spectrogram_comparison.png', bbox_inches='tight', dpi=150, facecolor='#07080f')
+plt.show()
+print("✅ Saved: /content/spectrogram_comparison.png")
+
+# ── CELL 15: Waveform Comparison ──────────────────────────────────────────────
+# @title Cell 15 — Waveform Comparison (Time Domain)
+
+# Use sample 0 from 'chosen' for a single detailed waveform view
+ref_nf, ref_cf = chosen[0]
+noisy_wav, _ = librosa.load(ref_nf, sr=SR, mono=True)
+clean_wav, _ = librosa.load(ref_cf, sr=SR, mono=True)
+ae_wav, _, _ = denoise_audio(noisy_wav)
+nr_wav       = apply_stat_nr(noisy_wav)   # recompute for this sample
+
+# Save the denoised audio files for this reference sample
+sf.write('/content/sample_noisy.wav',   noisy_wav, SR)
+sf.write('/content/sample_statNR.wav',  nr_wav,    SR)
+sf.write('/content/sample_unet_ae.wav', ae_wav,    SR)
+sf.write('/content/sample_clean.wav',   clean_wav, SR)
+print("✅ Reference audio files saved to /content/")
+
+t_n = np.linspace(0, len(noisy_wav) / SR, len(noisy_wav))
+t_a = np.linspace(0, len(ae_wav)    / SR, len(ae_wav))
+t_c = np.linspace(0, len(clean_wav) / SR, len(clean_wav))
+
+fig, axes = plt.subplots(4, 1, figsize=(16, 10), sharex=False)
+fig.patch.set_facecolor('#07080f')
+fig.suptitle('Waveform Comparison — Single Test Sample', fontsize=14,
+             fontweight='bold', color='white')
+
+waveforms = [
+    (t_n, noisy_wav,               ROSE,   'Noisy Input'),
+    (t_n, nr_wav[:len(t_n)],       AMBER,  'Statistical NR Only'),
+    (t_a, ae_wav,                  GREEN,  'U-Net Autoencoder Denoised'),
+    (t_c, clean_wav,               ACCENT, 'Clean Reference'),
+]
+
+for ax, (t, w, col, lbl) in zip(axes, waveforms):
+    ax.plot(t[:len(w)], w[:len(t)], color=col, lw=0.7, alpha=0.9)
+    ax.fill_between(t[:len(w)], w[:len(t)], alpha=0.15, color=col)
+    ax.set_ylabel('Amplitude', fontsize=9)
+    ax.set_title(lbl, fontsize=10, fontweight='bold', loc='left', pad=4)
+    ax.set_xlim(0, min(t[-1], t_c[-1]))
+    ax.grid(True, alpha=0.2)
+    if lbl != 'Clean Reference':
+        snr_val = compute_snr(clean_wav, w)
+        ax.text(0.98, 0.82, f'SNR: {snr_val:.1f} dB', transform=ax.transAxes,
+                ha='right', fontsize=10, color='white',
+                bbox=dict(boxstyle='round,pad=0.3', fc='#1a1c35', ec=col, alpha=0.85))
+
+axes[-1].set_xlabel('Time (seconds)', fontsize=10)
+plt.tight_layout()
+plt.savefig('/content/waveform_comparison.png', bbox_inches='tight', dpi=150, facecolor='#07080f')
+plt.show()
+print("✅ Saved: /content/waveform_comparison.png")
+
+# ── CELL 16: Noise Mask Heatmap ────────────────────────────────────────────────
+# @title Cell 16 — Noise Mask Heatmap (What the Autoencoder Removed)
+
+ae_wav_ref, mel_n_ref, mel_ae_ref = denoise_audio(noisy_wav)
+mel_diff = mel_n_ref - mel_ae_ref   # difference = removed noise
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig.patch.set_facecolor('#07080f')
+fig.suptitle('Noise Mask — What the Autoencoder Removed',
+             fontsize=13, fontweight='bold', color='white')
+
+for ax, spec, title, cmap in zip(
+    axes,
+    [mel_n_ref, mel_ae_ref, mel_diff],
+    ['Noisy Input', 'Denoised Output', 'Removed Noise (Difference)'],
+    ['magma', 'viridis', 'RdBu_r']
+):
+    img = librosa.display.specshow(spec, sr=SR, hop_length=HOP_LENGTH,
+                                    x_axis='time', y_axis='mel',
+                                    fmax=SR // 2, ax=ax, cmap=cmap)
+    ax.set_title(title, fontsize=11, fontweight='bold', color='white')
+    plt.colorbar(img, ax=ax, format='%+2.0f dB', pad=0.01)
+
+plt.tight_layout()
+plt.savefig('/content/noise_mask.png', bbox_inches='tight', dpi=150, facecolor='#07080f')
+plt.show()
+print("✅ Saved: /content/noise_mask.png")
+
+# ── CELL 17: Frequency-Band Similarity Plot ───────────────────────────────────
+# @title Cell 17 — Frequency-Band Similarity to Clean Reference
+
+mel_clean_ref = wav_to_mel(clean_wav)
+
+def normalize_for_ssim(s):
+    return (s - s.min()) / (s.max() - s.min() + 1e-8)
+
+mel_n_n  = normalize_for_ssim(mel_n_ref)
+mel_ae_n = normalize_for_ssim(mel_ae_ref)
+mel_c_n  = normalize_for_ssim(mel_clean_ref)
+
+# Per-band correlation (proxy for SSIM; SSIM needs ≥7 pixels width)
+ssim_noisy_bands, ssim_ae_bands = [], []
+for b in range(mel_n_n.shape[0]):
+    cn  = np.corrcoef(mel_n_n[b],  mel_c_n[b])[0, 1]
+    ca  = np.corrcoef(mel_ae_n[b], mel_c_n[b])[0, 1]
+    ssim_noisy_bands.append(max(cn, 0.0))
+    ssim_ae_bands.append(max(ca, 0.0))
+
+mel_freqs = librosa.mel_frequencies(n_mels=N_MELS, fmin=0, fmax=SR // 2)
+
+fig, ax = plt.subplots(figsize=(12, 5))
+fig.patch.set_facecolor('#07080f')
+ax.fill_between(mel_freqs, ssim_noisy_bands, alpha=0.4,  color=ROSE,  label='Noisy Input')
+ax.fill_between(mel_freqs, ssim_ae_bands,    alpha=0.55, color=GREEN, label='U-Net Denoised')
+ax.plot(mel_freqs, ssim_noisy_bands, color=ROSE,  lw=2)
+ax.plot(mel_freqs, ssim_ae_bands,    color=GREEN, lw=2)
+ax.set_xscale('log'); ax.set_xlim(mel_freqs[1], mel_freqs[-1])
+ax.set_xlabel('Frequency (Hz) — log scale', fontsize=11)
+ax.set_ylabel('Correlation with Clean Reference', fontsize=11)
+ax.set_title('Per-Frequency-Band Similarity to Clean Reference\n(Higher = More Similar)',
+             fontsize=12, fontweight='bold')
+ax.legend(fontsize=11); ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('/content/frequency_ssim.png', bbox_inches='tight', dpi=150, facecolor='#07080f')
+plt.show()
+print("✅ Saved: /content/frequency_ssim.png")
+
+# ── CELL 18: Listen to Audio Results ──────────────────────────────────────────
+# @title Cell 18 — Listen & Compare Audio Results (play inside Colab)
+
+print("=" * 55)
+print("  AUDIO PLAYBACK COMPARISON")
+print("=" * 55)
+
+print("\n🔴  [1] NOISY INPUT:")
+display(Audio(noisy_wav, rate=SR))
+
+print("\n🟡  [2] STATISTICAL NR ONLY:")
+display(Audio(nr_wav, rate=SR))
+
+print("\n🟢  [3] U-NET AUTOENCODER DENOISED  ← Main Result")
+display(Audio(ae_wav, rate=SR))
+
+print("\n🔵  [4] CLEAN REFERENCE (ground truth):")
+display(Audio(clean_wav[:len(ae_wav)], rate=SR))
+
+print("\n📊  SNR Summary for this sample:")
+print(f"   Noisy  input : {compute_snr(clean_wav, noisy_wav):.2f} dB")
+print(f"   Stat NR only : {compute_snr(clean_wav, nr_wav):.2f} dB")
+print(f"   U-Net AE     : {compute_snr(clean_wav, ae_wav):.2f} dB")
+
+# ── CELL 19: Final Summary Dashboard ──────────────────────────────────────────
+# @title Cell 19 — Final Results Dashboard (all-in-one figure)
+
+fig = plt.figure(figsize=(20, 14))
+fig.patch.set_facecolor('#07080f')
+gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.35)
+fig.suptitle(
+    'Deep Learning Noise Cancellation — Final Results Dashboard\n'
+    'U-Net Convolutional Autoencoder  |  Mel-Spectrogram Domain',
+    fontsize=15, fontweight='bold', color='white', y=1.01
+)
+
+# Row 0: Training loss + model info table
+ax0 = fig.add_subplot(gs[0, :2])
+ep  = range(1, len(history.history['loss']) + 1)
+ax0.plot(ep, history.history['loss'],     color=ACCENT, lw=2.2, label='Train Loss')
+ax0.plot(ep, history.history['val_loss'], color=CYAN,   lw=2.2, ls='--', label='Val Loss')
+ax0.set_title('Training / Validation Loss', fontsize=12, fontweight='bold')
+ax0.set_xlabel('Epoch'); ax0.set_ylabel('Loss')
+ax0.legend(); ax0.grid(True, alpha=0.3)
+
+ax1 = fig.add_subplot(gs[0, 2]); ax1.axis('off')
+info = [
+    ['Model',       'U-Net Autoencoder'],
+    ['Parameters',  f'{model.count_params():,}'],
+    ['Input patch', f'{PATCH_SIZE}×{PATCH_SIZE}'],
+    ['Loss fn',     '0.7·MSE + 0.3·SSIM'],
+    ['Optimizer',   'Adam  lr=1e-3'],
+    ['Epochs run',  str(len(history.history['loss']))],
+    ['Dataset',     'LibriSpeech dev-clean'],
+    ['Noise types', ', '.join(NOISE_TYPES)],
+    ['SNR range',   f'{SNR_RANGE[0]}–{SNR_RANGE[1]} dB'],
+    ['Sample Rate', f'{SR} Hz'],
+]
+tbl = ax1.table(cellText=info, colLabels=['Property', 'Value'], cellLoc='left', loc='center')
+tbl.auto_set_font_size(False); tbl.set_fontsize(9); tbl.scale(1.1, 1.55)
+for (r, c), cell in tbl.get_celld().items():
+    cell.set_facecolor('#111328' if r > 0 else '#1e2040')
+    cell.set_edgecolor('#2a2d4a'); cell.set_text_props(color='white')
+ax1.set_title('Model Configuration', fontsize=11, fontweight='bold')
+
+# Row 1: SNR / PSNR / SSIM bar charts
+for col, (ylabel, key) in enumerate([('SNR (dB)', 'snr'), ('PSNR (dB)', 'psnr'), ('Spec SSIM', 'ssim')]):
+    ax = fig.add_subplot(gs[1, col])
+    mnv = [summary[f'{key}_{m}'][0] for m in methods]
+    sdv = [summary[f'{key}_{m}'][1] for m in methods]
+    bars = ax.bar(['Noisy', 'StatNR', 'U-Net'], mnv, color=[ROSE, AMBER, GREEN],
+                  yerr=sdv, capsize=5, width=0.55, zorder=3,
+                  error_kw={'color': 'white', 'lw': 1.2},
+                  edgecolor='#1e2040', linewidth=0.8)
+    for b, v in zip(bars, mnv):
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.01,
+                f'{v:.2f}', ha='center', va='bottom', fontsize=9,
+                fontweight='bold', color='white')
+    ax.set_title(ylabel, fontsize=11, fontweight='bold')
+    ax.set_ylabel(ylabel, fontsize=9); ax.grid(True, axis='y', alpha=0.3)
+
+# Row 2: Spectrogram thumbnails
+for col, (spec, title, cmap) in enumerate(zip(
+    [mel_n_ref, mel_ae_ref, mel_clean_ref],
+    ['Noisy Input', 'U-Net Denoised', 'Clean Reference'],
+    ['magma', 'viridis', 'plasma']
+)):
+    ax = fig.add_subplot(gs[2, col])
+    librosa.display.specshow(spec, sr=SR, hop_length=HOP_LENGTH,
+                              x_axis='time', y_axis='mel', fmax=SR // 2, ax=ax, cmap=cmap)
+    ax.set_title(title, fontsize=11, fontweight='bold', color='white')
+
+plt.savefig('/content/final_dashboard.png', bbox_inches='tight', dpi=150, facecolor='#07080f')
+plt.show()
+print("✅ Saved: /content/final_dashboard.png")
+
+# ── CELL 20: Save All Files & Download ────────────────────────────────────────
+# @title Cell 20 — Save Model + All Results & Download
+
+import shutil
+from google.colab import files
+
+# Save trained model
+model.save('/content/unet_denoiser.keras')
+print("✅ Model saved: /content/unet_denoiser.keras")
+
+# List all output files (plots + audio + model)
+output_files = [
+    '/content/training_curves.png',
+    '/content/metrics_comparison.png',
+    '/content/snr_distribution.png',
+    '/content/spectrogram_comparison.png',
+    '/content/waveform_comparison.png',
+    '/content/noise_mask.png',
+    '/content/frequency_ssim.png',
+    '/content/final_dashboard.png',
+    '/content/sample_noisy.wav',       # ← original noisy audio
+    '/content/sample_statNR.wav',      # ← after statistical NR only
+    '/content/sample_unet_ae.wav',     # ← after U-Net autoencoder (main result)
+    '/content/sample_clean.wav',       # ← clean reference
+    '/content/unet_denoiser.keras',    # ← trained model weights
+]
+
+print("\n📁 Generated output files:")
+for fp in output_files:
+    size = os.path.getsize(fp) / 1024 if os.path.exists(fp) else 0
+    status = '✅' if os.path.exists(fp) else '❌'
+    print(f"   {status}  {fp}  ({size:.1f} KB)")
+
+# Create a tidy zip of only the outputs (not the huge dataset)
+zip_path = '/content/noise_cancellation_outputs'
+os.makedirs('/content/_outputs_tmp', exist_ok=True)
+for fp in output_files:
+    if os.path.exists(fp):
+        shutil.copy(fp, '/content/_outputs_tmp/')
+shutil.make_archive(zip_path, 'zip', '/content/_outputs_tmp/')
+print(f"\n✅ All outputs zipped → {zip_path}.zip")
+
+# Auto-download everything to your local machine
+print("\n⬇️  Downloading all outputs…")
+for fp in output_files:
+    if os.path.exists(fp):
+        files.download(fp)
+files.download(f'{zip_path}.zip')
+
+print("\n✅ Done! All plots, audio files and model are saved.")
+print("   You can also find them in the 📁 Files panel on the left in Colab.")
+
+# ── CELL 21: Upload & Denoise YOUR OWN Audio ──────────────────────────────────
+# @title Cell 21 — [OPTIONAL] Upload & Denoise Your Own Audio File
+
+from google.colab import files as colab_files
+
+print("📂 Upload your own noisy audio file (WAV, MP3, FLAC, OGG):")
+uploaded = colab_files.upload()
+
+for fname, fbytes in uploaded.items():
+    save_path = f'/content/user_{fname}'
+    with open(save_path, 'wb') as fh:
+        fh.write(fbytes)
+
+    print(f"\n🔄 Processing: {fname}  ({len(fbytes)/1024:.1f} KB)")
+    user_audio, _ = librosa.load(save_path, sr=SR, mono=True)
+    user_ae, _, _ = denoise_audio(user_audio)
+    user_nr        = apply_stat_nr(user_audio)
+
+    # Save outputs
+    stem           = fname.rsplit('.', 1)[0]
+    out_ae_path    = f'/content/denoised_unet_{stem}.wav'
+    out_nr_path    = f'/content/denoised_statNR_{stem}.wav'
+    sf.write(out_ae_path, user_ae, SR)
+    sf.write(out_nr_path, user_nr, SR)
+
+    print(f"   Duration : {len(user_audio)/SR:.2f} s  |  Sample rate: {SR} Hz")
+
+    print("\n🔴  Original Noisy Audio:")
+    display(Audio(user_audio, rate=SR))
+
+    print("\n🟡  Statistical NR Only:")
+    display(Audio(user_nr, rate=SR))
+
+    print("\n🟢  U-Net Autoencoder Denoised  ← Compare with original above")
+    display(Audio(user_ae, rate=SR))
+
+    print(f"\n⬇️  Downloading denoised files…")
+    colab_files.download(out_ae_path)
+    colab_files.download(out_nr_path)
+    print(f"✅ Saved: {out_ae_path}")
+    print(f"✅ Saved: {out_nr_path}")
